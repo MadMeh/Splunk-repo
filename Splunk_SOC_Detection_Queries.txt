@@ -1,0 +1,176 @@
+SOC SPLUNK DETECTION PACK
+Windows Active Directory and Account Activity
+Examples for learning and adaptation
+
+IMPORTANT SETUP NOTES
+- Replace index=wineventlog with your actual index.
+- Confirm your field names in a raw event before using a query. Common fields include EventCode, EventID, SubjectUserName, TargetUserName, ComputerName, and LogonType, but names vary by sourcetype and CIM mapping.
+- Test in Search first, validate results with an analyst, then configure alert scheduling, suppression, severity, and response steps.
+- Windows Security auditing and log forwarding must be enabled for the relevant events.
+- A matching event is not automatically malicious. Check approved change tickets, account ownership, source host, and normal administrator activity.
+
+1) PASSWORD RESET ATTEMPT — EVENT 4724
+Purpose: Find attempts to reset another account's password.
+
+index=wineventlog EventCode=4724
+| eval Initiator=coalesce(SubjectUserName, Subject_Account_Name)
+| eval Target=coalesce(TargetUserName, Target_Account_Name)
+| table _time host Initiator Target SubjectDomainName TargetDomainName EventCode Message
+| sort - _time
+
+Investigate unexpected initiators, sensitive targets, and activity outside normal change windows. Event 4724 indicates an attempt, not proof of success.
+
+2) USER ACCOUNT CHANGED — EVENT 4738
+Purpose: Find account changes for review.
+
+index=wineventlog EventCode=4738
+| eval Initiator=coalesce(SubjectUserName, Subject_Account_Name)
+| eval Target=coalesce(TargetUserName, Target_Account_Name)
+| table _time host Initiator Target EventCode Message
+| sort - _time
+
+Review the event details for the changed attributes and compare with approved administration.
+
+3) 4724 FOLLOWED BY 4738 FOR THE SAME TARGET WITHIN 5 MINUTES
+Purpose: Correlate a password-reset attempt with an account-change event. This is a hunting starting point, not proof that the reset caused the change.
+
+index=wineventlog (EventCode=4724 OR EventCode=4738)
+| eval Event_ID=tostring(coalesce(EventCode, EventID))
+| eval Initiator=coalesce(SubjectUserName, Subject_Account_Name)
+| eval Target=lower(coalesce(TargetUserName, Target_Account_Name, Account_Name))
+| where isnotnull(Target) AND Target!=""
+| sort 0 Target _time
+| streamstats current=f window=1 last(Event_ID) as Previous_Event last(_time) as Previous_Time last(Initiator) as Previous_Initiator by Target
+| where Event_ID="4738" AND Previous_Event="4724" AND (_time-Previous_Time)<=300 AND (_time-Previous_Time)>=0
+| eval Time_Difference_Seconds=_time-Previous_Time
+| table _time Target Previous_Initiator Initiator Previous_Time Time_Difference_Seconds Previous_Event Event_ID host
+| sort - _time
+
+This checks the immediately previous event for that target. If other events may occur between the two, use a broader time-window correlation and validate the results. Field normalization and event ordering must be tested with your data.
+
+4) PASSWORD RESET ATTEMPTS BY INITIATOR — FIND MULTIPLE TARGETS
+Purpose: Identify users attempting resets against several accounts in 15 minutes.
+
+index=wineventlog EventCode=4724
+| eval Initiator=lower(coalesce(SubjectUserName, Subject_Account_Name))
+| eval Target=lower(coalesce(TargetUserName, Target_Account_Name))
+| where isnotnull(Initiator) AND Initiator!=""
+| bin _time span=15m
+| stats count dc(Target) as Unique_Targets values(Target) as Targets values(host) as Hosts by _time Initiator
+| where count>=5 OR Unique_Targets>=3
+| sort - count
+
+Tune the thresholds to your environment and exclude approved bulk administration only when justified.
+
+5) PRIVILEGED GROUP MEMBERSHIP CHANGES
+Purpose: Hunt for additions to security-enabled global, domain-local, or universal groups.
+
+index=wineventlog (EventCode=4728 OR EventCode=4732 OR EventCode=4756)
+| eval Initiator=coalesce(SubjectUserName, Subject_Account_Name)
+| eval Member=coalesce(MemberName, Member_Account_Name)
+| eval Group=coalesce(TargetUserName, Target_Account_Name)
+| table _time host EventCode Initiator Member Group Message
+| sort - _time
+
+Common event IDs:
+- 4728: member added to a security-enabled global group.
+- 4732: member added to a security-enabled local group.
+- 4756: member added to a security-enabled universal group.
+Prioritise privileged groups such as Domain Admins, Enterprise Admins, and other high-impact groups used in your organisation. Group names and fields vary.
+
+6) USER ACCOUNT CREATED
+Purpose: Find newly created accounts.
+
+index=wineventlog EventCode=4720
+| eval Initiator=coalesce(SubjectUserName, Subject_Account_Name)
+| eval New_User=coalesce(TargetUserName, Target_Account_Name)
+| table _time host Initiator New_User Message
+| sort - _time
+
+Investigate unexpected creator accounts, unusual hosts, and accounts created outside approved processes.
+
+7) USER ACCOUNT ENABLED OR DISABLED
+Purpose: Track enable/disable actions.
+
+index=wineventlog (EventCode=4722 OR EventCode=4725)
+| eval Initiator=coalesce(SubjectUserName, Subject_Account_Name)
+| eval Target=coalesce(TargetUserName, Target_Account_Name)
+| table _time host EventCode Initiator Target Message
+| sort - _time
+
+4722 = account enabled. 4725 = account disabled. Validate that the action aligns with HR and access-management processes.
+
+8) ACCOUNT ADDED TO OR REMOVED FROM A GROUP
+Purpose: Monitor group membership changes beyond only privileged-group additions.
+
+index=wineventlog (EventCode=4728 OR EventCode=4729 OR EventCode=4732 OR EventCode=4733 OR EventCode=4756 OR EventCode=4757)
+| eval Initiator=coalesce(SubjectUserName, Subject_Account_Name)
+| eval Member=coalesce(MemberName, Member_Account_Name)
+| eval Group=coalesce(TargetUserName, Target_Account_Name)
+| table _time host EventCode Initiator Member Group Message
+| sort - _time
+
+Addition events: 4728, 4732, 4756. Removal events: 4729, 4733, 4757.
+
+9) MANY FAILED LOGINS FOLLOWED BY A SUCCESS WITHIN 2 MINUTES
+Purpose: Identify possible password guessing followed by a successful logon. Validate fields and account/host correlation.
+
+index=wineventlog (EventCode=4625 OR EventCode=4624)
+| eval User=lower(coalesce(TargetUserName, Account_Name))
+| eval SrcIP=coalesce(IpAddress, Source_Network_Address)
+| eval LogonEvent=tostring(EventCode)
+| where isnotnull(User) AND User!=""
+| sort 0 User SrcIP _time
+| streamstats time_window=2m
+    count(eval(LogonEvent="4625")) as Failed_Count
+    count(eval(LogonEvent="4624")) as Success_Count
+    by User SrcIP
+| where LogonEvent="4624" AND Failed_Count>=4
+| table _time User SrcIP Failed_Count host LogonEvent
+| sort - _time
+
+Important: Validate whether the streamstats window and event sequence fit your Splunk version and data. A robust production rule should explicitly confirm that the failures precede the success, and should handle missing/IPv6 source addresses and service accounts.
+
+10) SUSPICIOUS PROCESS CREATION — EVENT 4688
+Purpose: Review process creation for unusual executables or command lines.
+
+index=wineventlog EventCode=4688
+| eval User=coalesce(SubjectUserName, Subject_Account_Name)
+| eval Process=coalesce(NewProcessName, New_Process_Name)
+| eval Parent=coalesce(ParentProcessName, Creator_Process_Name)
+| eval CommandLine=coalesce(ProcessCommandLine, Command_Line)
+| table _time host User Process Parent CommandLine Message
+| sort - _time
+
+Process command-line logging may need to be enabled. Build detections around your environment's threat model, known-bad indicators, and parent-child process patterns rather than alerting on every process.
+
+11) SERVICE INSTALLED — EVENT 4697
+Purpose: Investigate unexpected service installation, which can be used for persistence or remote execution.
+
+index=wineventlog EventCode=4697
+| eval User=coalesce(SubjectUserName, Subject_Account_Name)
+| table _time host User ServiceName ServiceFileName ServiceType Message
+| sort - _time
+
+Field names depend on parsing. Review service binary path, signer, account, host role, and change approvals.
+
+12) AUDIT POLICY CHANGED — EVENT 4719
+Purpose: Detect changes to the system audit policy that could reduce visibility.
+
+index=wineventlog EventCode=4719
+| eval User=coalesce(SubjectUserName, Subject_Account_Name)
+| table _time host User Message
+| sort - _time
+
+Investigate unexpected changes, particularly on domain controllers and security infrastructure.
+
+ALERT DEPLOYMENT CHECKLIST
+1. Verify event IDs and field names against actual raw events.
+2. Run the query over a representative historical period and measure false positives.
+3. Set the correct schedule, time range, alert threshold, severity, and suppression policy.
+4. Add allowlists only for documented, approved activity.
+5. Include target account, initiating account, source host/IP, event time, and raw event in the alert.
+6. Document triage steps, escalation criteria, and response owner.
+7. Test the alert after every field extraction, data-source, or Splunk upgrade change.
+
+END OF DOCUMENT
