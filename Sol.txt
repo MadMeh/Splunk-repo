@@ -1,0 +1,217 @@
+Splunk Threat-Hunting Queries — PHP2Shell and Miasma
+Investigation date: 12 October 2026 (Australian date format: 12/10/2026) Purpose: Manual threat hunting using web and endpoint telemetry, with Splunk CIM where available. Important: These are starting-point hunts. Validate field mappings, threat indicators, and telemetry coverage before relying on results. A match is not proof of compromise.
+Time range
+Both searches below use an explicit single-day window:
+earliest=10/12/2026:00:00:00 latest=10/13/2026:00:00:00
+Confirm your Splunk user’s timezone and date parsing. If your deployment interprets time strings differently, select 12 October 2026 in the time picker and remove the explicit time modifiers from the SPL.
+￼
+1. PHP2Shell — web exploit indicators and endpoint process behaviour
+Objective
+Surface suspicious PHP upload/session indicators, PHP memory exhaustion, large POST errors, and suspicious child processes of web-server processes. This combines multiple clues in a ten-minute bucket; it does not prove the events are causally related.
+index=* earliest=10/12/2026:00:00:00 latest=10/13/2026:00:00:00
+(
+    "PHP_SESSION_UPLOAD_PROGRESS"
+    OR "PHPSESSID"
+    OR "multipart/form-data"
+    OR "Allowed memory size of"
+    OR "bytes exhausted"
+    OR "php-fpm"
+    OR "apache2"
+    OR "httpd"
+    OR "nginx"
+)
+| eval raw=lower(_raw)
+| eval asset=lower(coalesce(dvc, dest_host, ComputerName, host))
+| eval src_norm=coalesce(src, src_ip, client_ip, c_ip, 'id.orig_h')
+| eval uri_norm=coalesce(uri, uri_path, url, cs_uri_stem)
+| eval method_norm=upper(coalesce(http_method, method, cs_method))
+| eval status_norm=tonumber(coalesce(status, status_code, sc_status))
+| eval headers_norm=lower(coalesce(request_headers, http_request_headers, ""))
+| eval cmd=lower(coalesce(process, process_command_line, CommandLine, process_name, Image, ""))
+| eval parent=lower(coalesce(parent_process_name, ParentImage, parent_process_path, ""))
+| eval web_upload=if(
+    match(headers_norm." ".raw,"multipart/form-data")
+    AND method_norm="POST",1,0)
+| eval session_progress=if(
+    match(raw." ".headers_norm,"php_session_upload_progress"),1,0)
+| eval php_session_code=if(
+    match(raw." ".headers_norm,"phpsessid")
+    AND match(raw." ".headers_norm,"<\\?php|<\\?="),1,0)
+| eval serialized_payload=if(
+    match(raw." ".headers_norm,"php_session_upload_progress")
+    AND match(raw." ".headers_norm,"serialized|(^|[^a-z])o:[0-9]+:\"|s:[0-9]+:\""),1,0)
+| eval memory_exhaustion=if(
+    match(raw,"allowed memory size of.*bytes exhausted|memory exhausted"),1,0)
+| eval large_post_error=if(
+    method_norm="POST" AND status_norm=500
+    AND tonumber(coalesce(bytes_in, request_length, http_request_body_bytes, 0))>=1048576,1,0)
+| eval web_shell_child=if(
+    match(parent,"php-fpm|php-cgi|apache2|httpd|nginx|w3wp|lsphp")
+    AND match(cmd,"(^|[/\\\\ ])(sh|bash|dash|curl|wget|python|perl|nc|ncat|socat|powershell|cmd)(\\.exe)?($|[ /\\\\])"),1,0)
+| eval inline_php=if(
+    match(cmd,"php.*(-r|-a)|php-cgi.*-d"),1,0)
+| eval signal=mvappend(
+    if(web_upload=1,"Multipart POST",null()),
+    if(session_progress=1,"PHP upload-progress marker",null()),
+    if(php_session_code=1,"PHP session field plus PHP tag",null()),
+    if(serialized_payload=1,"Possible serialized upload payload",null()),
+    if(memory_exhaustion=1,"PHP memory exhaustion",null()),
+    if(large_post_error=1,"Large POST with HTTP 500",null()),
+    if(web_shell_child=1,"Web server suspicious child process",null()),
+    if(inline_php=1,"Inline PHP execution",null()))
+| where mvcount(signal)>0
+| bin _time span=10m
+| stats
+    count as event_count
+    dc(signal) as distinct_signal_count
+    values(signal) as signals
+    values(src_norm) as source_ips
+    values(uri_norm) as request_uris
+    values(method_norm) as http_methods
+    values(status_norm) as http_statuses
+    values(parent) as parent_processes
+    values(cmd) as process_commands
+    values(sourcetype) as sourcetypes
+    values(source) as log_sources
+    values(_raw) as evidence
+    min(_time) as first_seen
+    max(_time) as last_seen
+    by _time asset
+| eval priority=case(
+    distinct_signal_count>=3,"HIGH",
+    mvfind(signals,"Web server suspicious child process")>=0
+        AND mvfind(signals,"PHP session field plus PHP tag")>=0,"HIGH",
+    distinct_signal_count=2,"MEDIUM",
+    true(),"LOW")
+| convert ctime(first_seen) ctime(last_seen)
+| sort - distinct_signal_count - event_count
+Investigation guidance
+	●	Multipart POST alone: common legitimate web traffic; low confidence.
+	●	Session upload-progress marker: investigate request URI, client IP, request headers and application logs.
+	●	PHP memory exhaustion: can be a denial-of-service symptom or a benign application failure.
+	●	Web server spawning a shell/downloader: potentially high priority; confirm the actual parent PID, child PID, command line and process start time from endpoint telemetry.
+	●	Best evidence: suspicious request followed by an unexpected child process on the same web server within a short interval.
+Field mapping and limitations
+	●	CIM Web fields often include src, dest, uri, http_method, status, and user_agent, but field names depend on the data model and sourcetype.
+	●	CIM Endpoint process events commonly expose process and parent-process fields, but exact names vary by add-on. Confirm them with fieldsummary or representative raw events.
+	●	bytes_in is not consistently the HTTP request-body length. Map the correct web-log field before using the 1 MiB threshold.
+	●	If web logs do not record request bodies or headers, the PHP session and serialized-payload checks may not be detectable from those logs.
+	●	The query groups by asset and ten-minute bucket. This is temporal grouping, not a join proving the web request caused the process execution.
+	●	index=* can be expensive. Once you know the indexes, scope the search to relevant web, PHP, endpoint and network indexes.
+￼
+2. Miasma — published indicators and behavioural investigation
+Objective
+Search for the campaign strings and SHA-1 values listed below, plus payload-path, persistence, package-family and Node/Bun process clues. Validate every exact IOC against the primary threat-intelligence report your team uses before treating it as authoritative. Indicators can refer to different campaign variants or stages.
+index=* earliest=10/12/2026:00:00:00 latest=10/13/2026:00:00:00
+(
+    "85.137.53.71"
+    OR "QmQobZSp1wRPrpSEQ56qnyq7ecZh5Bg5k1fnjt4SUwwHb9"
+    OR "X-Miasma-Spawn-Chain"
+    OR "miasma-train-p1"
+    OR "M-RED-TEAM v6.4"
+    OR "c8cb3f6d5b90c46686d2bf531dc1a5786e27edc5"
+    OR "22bf76fe317ea6769bd38619bd440e42d119bd6b"
+    OR "a7e18d96efd3cdb127ef4cdcad9e3ad26c482bf2"
+    OR "9890950adcbc2478e7a080234f053214adbad44e"
+    OR "c70e105e212ff3c1daa04bb2a62507717f296b0b"
+    OR "miasma-monitor"
+    OR "sync.js"
+    OR "binding.gyp"
+    OR "@asyncapi/generator"
+    OR "@redhat-cloud-services"
+    OR "NodeJS"
+    OR "bun"
+)
+| eval raw=lower(_raw)
+| eval asset=lower(coalesce(dvc, dest_host, ComputerName, host))
+| eval proc=lower(coalesce(process_name, Image, process_path, NewProcessName, ""))
+| eval parent=lower(coalesce(parent_process_name, ParentImage, parent_process_path, ""))
+| eval cmd=lower(coalesce(process, process_command_line, CommandLine, ""))
+| eval file=lower(coalesce(file_path, TargetFilename, file_name, TargetObject, ""))
+| eval dst=coalesce(dest_ip, 'id.resp_h', remote_ip, dest)
+| eval port=tonumber(coalesce(dest_port, 'id.resp_p'))
+| eval sha1=lower(coalesce(file_hash, sha1, file_hash_sha1, ""))
+| eval exact_network_ioc=if(
+    match(raw,"85\\.137\\.53\\.71")
+    OR match(raw,"qmQobzsp1wrprpseq56qnyq7eczh5bg5k1fnjt4suwwhb9")
+    OR match(raw,"x-miasma-spawn-chain")
+    OR match(raw,"miasma-train-p1")
+    OR match(raw,"m-red-team v6\\.4"),1,0)
+| eval exact_hash_ioc=if(
+    match(sha1,"^(c8cb3f6d5b90c46686d2bf531dc1a5786e27edc5|22bf76fe317ea6769bd38619bd440e42d119bd6b|a7e18d96efd3cdb127ef4cdcad9e3ad26c482bf2|9890950adcbc2478e7a080234f053214adbad44e|c70e105e212ff3c1daa04bb2a62507717f296b0b)$")
+    OR match(raw,"c8cb3f6d5b90c46686d2bf531dc1a5786e27edc5|22bf76fe317ea6769bd38619bd440e42d119bd6b|a7e18d96efd3cdb127ef4cdcad9e3ad26c482bf2|9890950adcbc2478e7a080234f053214adbad44e|c70e105e212ff3c1daa04bb2a62507717f296b0b"),1,0)
+| eval c2_port=if(dst="85.137.53.71" AND in(port,8080,8081,8091),1,0)
+| eval payload_path=if(
+    match(file." ".cmd,"nodejs[/\\\\]sync\\.js|\\.local/share/nodejs/sync\\.js|library/application support/nodejs/sync\\.js|localappdata.*nodejs.*sync\\.js"),1,0)
+| eval persistence=if(
+    match(raw." ".file." ".cmd,"miasma-monitor|\\.miasma[/\\\\]run[/\\\\]node\\.lock|### node auto-update script ###|gl_cache\\.bin|index-v2\\.cache|msrt\\.dat"),1,0)
+| eval suspicious_chain=if(
+    match(parent,"node|npm|bun")
+    AND match(proc,"(^|[/\\\\ ])(sh|bash|dash|curl|wget|bun|node)(\\.exe)?($|[ /\\\\])"),1,0)
+| eval affected_package=if(
+    match(raw,"@asyncapi/generator|@asyncapi/generator-helpers|@asyncapi/generator-components|@asyncapi/specs|@redhat-cloud-services"),1,0)
+| eval signal=mvappend(
+    if(exact_network_ioc=1,"Exact campaign/network IOC",null()),
+    if(exact_hash_ioc=1,"Exact SHA1 IOC",null()),
+    if(c2_port=1,"Known C2 IP and port",null()),
+    if(payload_path=1,"Known payload path",null()),
+    if(persistence=1,"Persistence/artifact indicator",null()),
+    if(suspicious_chain=1,"Suspicious Node/Bun child process",null()),
+    if(affected_package=1,"Affected package family reference",null()))
+| where mvcount(signal)>0
+| bin _time span=15m
+| stats
+    count as event_count
+    dc(signal) as distinct_signal_count
+    values(signal) as signals
+    values(dst) as destination_ips
+    values(port) as destination_ports
+    values(sha1) as file_hashes
+    values(proc) as processes
+    values(parent) as parent_processes
+    values(cmd) as command_lines
+    values(file) as files
+    values(user) as users
+    values(source) as log_sources
+    values(sourcetype) as sourcetypes
+    values(_raw) as evidence
+    min(_time) as first_seen
+    max(_time) as last_seen
+    by _time asset
+| eval priority=case(
+    mvfind(signals,"Exact SHA1 IOC")>=0,"CRITICAL",
+    mvfind(signals,"Exact campaign/network IOC")>=0,"HIGH",
+    mvfind(signals,"Known C2 IP and port")>=0,"HIGH",
+    mvfind(signals,"Known payload path")>=0 AND mvfind(signals,"Persistence/artifact indicator")>=0,"HIGH",
+    distinct_signal_count>=2,"MEDIUM",
+    true(),"LOW")
+| convert ctime(first_seen) ctime(last_seen)
+| sort - distinct_signal_count - event_count
+Investigation guidance
+	●	Exact SHA-1 match: verify that the field is a file hash, not an unrelated hash embedded in a log message. Retrieve file metadata and endpoint context.
+	●	Known IP and port: verify destination, connection direction, process, DNS/proxy history and bytes transferred. A string in a log is not necessarily a network connection.
+	●	Payload or persistence path: validate file creation, modification time, owner, process ancestry and persistence mechanism.
+	●	Node/Bun chain: correlate package-manager activity, process execution, outbound connections and file writes. These runtimes are common in legitimate development environments.
+	●	Package-family reference: confirm exact package name, version, install source and whether the relevant version is actually malicious.
+Field mapping and limitations
+	●	Network CIM fields commonly include src, dest, dest_port, transport, bytes_in and bytes_out; actual fields depend on the data source and add-on.
+	●	File hash field names vary. Check whether your endpoint data exposes SHA-1 and whether the value is normalized.
+	●	File paths, command lines and parent process names may be absent from network and package audit logs.
+	●	affected_package is a broad package-family clue, not an exact malicious-version check. Do not raise a high-confidence alert from a package name alone.
+	●	The behavioural checks are heuristics. The query does not prove that events in the same 15-minute bucket belong to one infection chain.
+	●	The list of hashes and campaign strings should be checked against the primary research/advisory and your threat-intelligence platform before operational use.
+￼
+False-positive handling and next steps
+	1.	Start with evidence: inspect evidence, sourcetypes, and log_sources before assigning a verdict.
+	2.	Confirm the asset: normalize hostnames and use an asset lookup if web and endpoint telemetry use different names.
+	3.	Validate event sequence: check original timestamps and process IDs. Bucket aggregation is for triage, not causal proof.
+	4.	Tune benign patterns: allowlist known administrative scripts, approved PHP maintenance tasks, and sanctioned Node/Bun build runners only after validating ownership and behaviour.
+	5.	Separate confidence from severity: a single exact IOC may be high confidence, while multiple generic behavioural signals may still be benign.
+	6.	Scope indexes: replace index=* with the specific web, PHP, endpoint and network indexes after confirming where each data source is stored.
+	7.	Test coverage: if request bodies, PHP errors, file hashes, process ancestry or network events are not ingested, the corresponding parts of the hunt cannot reliably detect them.
+Date note
+The searches are explicitly scoped to 12 October 2026. PHP2Shell was publicly disclosed later in October, so activity found on 12 October should be treated as historical behaviour requiring validation—not automatically attributed to the subsequently publicised campaign.
+References for analyst validation
+	●	Splunk Research — PHP2Shell analytics story: https://research.splunk.com/stories/php2shell/
+	●	JFrog Research — Miasma worm campaign analysis: https://research.jfrog.com/post/miasma-worm-returns-to-npm/
+Verify current URLs, exact indicators, hash types, package versions and variant attribution against the source advisories before using these searches in an incident response or detection rule.
