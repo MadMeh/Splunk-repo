@@ -1,0 +1,137 @@
+Splunk Server Threat Hunting — 10 Hunts in One SPL Query
+A consolidated query to hunt across Windows servers for suspicious PowerShell, service creation, scheduled tasks, administrator-group changes, credential-access tooling, log clearing, remote logons, web-server file activity, account creation, and unusual outbound connections.
+> **Important:** This is a starting-point hunting query, not a production-ready detection. It depends on the indexes, sourcetypes, field extractions, audit policies and endpoint telemetry available in your environment. Validate the field names against your own events before relying on the results.
+1. Consolidated SPL
+Replace the sample hostnames with the servers you want to investigate. Replace index=windows and index=sysmon if your environment uses different index names.
+| makeresults
+| eval _time=now(), host="N/A", user="N/A", hunt="Query initialisation", details="No findings"
+| fields _time host user hunt details
+| where 1=0
+
+| append [
+    search index=windows host IN ("SERVER01","SERVER02","DC01","JUMP01") EventCode=4688
+        ("EncodedCommand" OR "FromBase64String" OR "DownloadString" OR "Invoke-WebRequest" OR " -WindowStyle Hidden")
+    | eval hunt="01 - Suspicious PowerShell",
+           user=coalesce(user, SubjectUserName, Account_Name, "Unknown"),
+           details=coalesce(Process_Command_Line, CommandLine, NewProcessName, "PowerShell-related command")
+    | fields _time host user hunt details NewProcessName ParentProcessName Process_Command_Line
+]
+
+| append [
+    search index=windows host IN ("SERVER01","SERVER02","DC01","JUMP01") (EventCode=7045 OR EventCode=4697)
+    | eval hunt="02 - Service creation",
+           user=coalesce(user, SubjectUserName, Account_Name, "Unknown"),
+           details=coalesce(ServiceName, ServiceFileName, ImagePath, "Service created")
+    | fields _time host user hunt details ServiceName ServiceFileName ImagePath
+]
+
+| append [
+    search index=windows host IN ("SERVER01","SERVER02","DC01","JUMP01") EventCode=4698
+    | eval hunt="03 - Scheduled task creation",
+           user=coalesce(user, SubjectUserName, Account_Name, "Unknown"),
+           details=coalesce(TaskName, TaskContent, "Scheduled task created")
+    | fields _time host user hunt details TaskName TaskContent
+]
+
+| append [
+    search index=windows host IN ("SERVER01","SERVER02","DC01","JUMP01") (EventCode=4732 OR EventCode=4733)
+    | eval hunt="04 - Local group membership change",
+           user=coalesce(SubjectUserName, user, Account_Name, "Unknown"),
+           details=coalesce(MemberName, TargetUserName, "Group membership changed")
+    | fields _time host user hunt details MemberName TargetUserName
+]
+
+| append [
+    search index=windows host IN ("SERVER01","SERVER02","DC01","JUMP01") EventCode=4688
+        (NewProcessName="*\\rundll32.exe" OR NewProcessName="*\\procdump.exe" OR NewProcessName="*\\nanodump.exe" OR Process_Command_Line="*comsvcs.dll*")
+    | eval hunt="05 - Possible credential-access tooling",
+           user=coalesce(user, SubjectUserName, Account_Name, "Unknown"),
+           details=coalesce(Process_Command_Line, NewProcessName, "Potential credential-access process")
+    | fields _time host user hunt details NewProcessName ParentProcessName Process_Command_Line
+]
+
+| append [
+    search index=windows host IN ("SERVER01","SERVER02","DC01","JUMP01") (EventCode=1102 OR EventCode=104)
+    | eval hunt="06 - Security or event log cleared",
+           user=coalesce(SubjectUserName, user, Account_Name, "Unknown"),
+           details=coalesce(Provider_Name, Channel, "Windows event log cleared")
+    | fields _time host user hunt details EventCode Provider_Name Channel
+]
+
+| append [
+    search index=windows host IN ("SERVER01","SERVER02","DC01","JUMP01") EventCode=4624 (LogonType=3 OR LogonType=10)
+    | eval hunt="07 - Remote logon",
+           user=coalesce(TargetUserName, user, Account_Name, "Unknown"),
+           details="LogonType=".LogonType." SourceIP=".coalesce(IpAddress, Source_Network_Address, "Unknown")
+    | fields _time host user hunt details LogonType IpAddress Source_Network_Address WorkstationName
+]
+
+| append [
+    search index=windows host IN ("SERVER01","SERVER02","DC01","JUMP01") EventCode=4663
+        (ObjectName="*.php" OR ObjectName="*.aspx" OR ObjectName="*.jsp")
+    | eval hunt="08 - Web-server file access",
+           user=coalesce(SubjectUserName, user, Account_Name, "Unknown"),
+           details=coalesce(ObjectName, "Web file accessed")
+    | fields _time host user hunt details ObjectName ProcessName AccessMask
+]
+
+| append [
+    search index=windows host IN ("SERVER01","SERVER02","DC01","JUMP01") EventCode=4720
+    | eval hunt="09 - User account created",
+           user=coalesce(SubjectUserName, user, Account_Name, "Unknown"),
+           details=coalesce(TargetUserName, "New account created")
+    | fields _time host user hunt details TargetUserName
+]
+
+| append [
+    search index=sysmon host IN ("SERVER01","SERVER02","DC01","JUMP01") EventCode=3
+    | eval hunt="10 - Outbound network connections",
+           user=coalesce(user, User, "Unknown"),
+           details="Image=".coalesce(Image, "Unknown")." Destination=".coalesce(DestinationIp, DestinationHostname, "Unknown").":".coalesce(tostring(DestinationPort), "Unknown")
+    | fields _time host user hunt details Image DestinationIp DestinationHostname DestinationPort Protocol
+]
+
+| eval host=coalesce(host, Computer, ComputerName, "Unknown"),
+       user=coalesce(user, "Unknown"),
+       details=coalesce(details, "No detail extracted")
+| table _time host user hunt details NewProcessName ParentProcessName Process_Command_Line ServiceName ServiceFileName ImagePath TaskName TaskContent MemberName TargetUserName LogonType IpAddress Source_Network_Address ObjectName ProcessName AccessMask Image DestinationIp DestinationHostname DestinationPort Protocol
+| sort 0 - _time
+2. What each hunt is looking for
+|# |Hunt                     |Primary telemetry                                      |What to investigate                                               | |--|-------------------------|-------------------------------------------------------|------------------------------------------------------------------| |01|Suspicious PowerShell    |Security 4688; ideally PowerShell 4104 and Sysmon 1 too|Encoded commands, download activity, unusual parent process       | |02|Service creation         |System 7045; Security 4697                             |Unexpected service binary, unusual path, unexpected creator       | |03|Scheduled task creation  |Security 4698; Task Scheduler operational logs         |New task, unusual trigger, script or binary launched              | |04|Local group membership   |Security 4732 / 4733                                   |Unexpected account added to or removed from a local security group| |05|Credential-access tooling|Security 4688; Sysmon 1 and 10                         |Suspicious process execution or LSASS access                      | |06|Log clearing             |Security 1102; System 104                              |Unexpected clearing of Security or other event logs               | |07|Remote logon             |Security 4624                                          |Unusual source, account, time, server or logon type               | |08|Web-server file activity |Security 4663; Sysmon 11                               |Unexpected script file access or creation in a web root           | |09|Account creation         |Security 4720                                          |Unexpected account, creator or timing                             | |10|Outbound connections     |Sysmon 3 or equivalent network telemetry               |Server process connecting to unusual destinations or ports        |
+3. Important field and telemetry assumptions
+	●	Windows Security events: The example assumes Windows events are searchable in index=windows and that EventCode is extracted.
+	●	Sysmon: Hunt 10 assumes Sysmon network connection events are in index=sysmon. If Sysmon is stored in the Windows index, change the relevant branch.
+	●	Process command line: 4688 command-line collection must be enabled. Field names vary by TA/CIM mapping; common alternatives include CommandLine, Process_Command_Line, NewProcessName and ParentProcessName.
+	●	Service creation: Event 7045 is a System log event. Event 4697 is a Security audit event and requires the relevant audit policy.
+	●	File access: Event 4663 requires file-system auditing and suitable SACLs. It does not automatically mean a file was created. Sysmon Event 11 is useful for file creation.
+	●	Credential access: Process-name matching is only a lead. Stronger LSASS-access hunting needs suitable process-access telemetry, such as Sysmon Event 10 or EDR telemetry.
+	●	Host filtering: The sample uses exact host values. If you want all hosts, remove the host IN (...) clause from each branch. Use the actual host field your data uses.
+4. False-positive handling and investigation
+Do not treat a match as proof of compromise. For each result:
+	1.	Confirm the host’s role and owner (domain controller, jump server, web server, application server, etc.).
+	2.	Validate the account, parent process, command line, binary path, signature and expected administrative activity.
+	3.	Compare the event time with change windows, deployment jobs and approved maintenance.
+	4.	Pivot on the host, user and time window to find related logons, process creation, group changes, scheduled tasks and network connections.
+	5.	Correlate with EDR alerts, DNS, proxy, firewall and identity telemetry where available.
+	6.	Document the evidence and disposition; escalate according to your SOC process if activity is unexplained.
+5. Practical tuning recommendations
+	●	Start with one or two hosts and a short time range to validate the query.
+	●	Confirm the correct index and field names using | fieldsummary or by inspecting raw events.
+	●	Add known administration tools and approved service accounts to documented allowlists only after validating their normal behaviour.
+	●	Consider converting high-confidence, well-tested hunts into detections with risk scoring, suppression and alert context.
+	●	The append subsearches are subject to Splunk subsearch limits and can be expensive. For large environments or high-volume time ranges, consider separate scheduled searches or a data-model-based approach.
+6. Quick validation searches
+Check which event codes exist for a host:
+index=windows host="SERVER01"
+| stats count by EventCode
+| sort - count
+Check actual process field names:
+index=windows host="SERVER01" EventCode=4688
+| head 20
+| table _time host *
+Check Sysmon network events:
+index=sysmon host="SERVER01" EventCode=3
+| head 20
+| table _time host *
+￼
+Hunting note: This consolidated search is designed for triage and exploration. It is not a substitute for enabling the required audit policies or collecting endpoint telemetry. A hunt that returns no events may indicate missing data rather than absence of attacker activity.
