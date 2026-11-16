@@ -1,137 +1,371 @@
-Splunk Server Threat Hunting — 10 Hunts in One SPL Query
-A consolidated query to hunt across Windows servers for suspicious PowerShell, service creation, scheduled tasks, administrator-group changes, credential-access tooling, log clearing, remote logons, web-server file activity, account creation, and unusual outbound connections.
-> **Important:** This is a starting-point hunting query, not a production-ready detection. It depends on the indexes, sourcetypes, field extractions, audit policies and endpoint telemetry available in your environment. Validate the field names against your own events before relying on the results.
-1. Consolidated SPL
-Replace the sample hostnames with the servers you want to investigate. Replace index=windows and index=sysmon if your environment uses different index names.
-| makeresults
-| eval _time=now(), host="N/A", user="N/A", hunt="Query initialisation", details="No findings"
-| fields _time host user hunt details
-| where 1=0
-
-| append [
-    search index=windows host IN ("SERVER01","SERVER02","DC01","JUMP01") EventCode=4688
-        ("EncodedCommand" OR "FromBase64String" OR "DownloadString" OR "Invoke-WebRequest" OR " -WindowStyle Hidden")
-    | eval hunt="01 - Suspicious PowerShell",
-           user=coalesce(user, SubjectUserName, Account_Name, "Unknown"),
-           details=coalesce(Process_Command_Line, CommandLine, NewProcessName, "PowerShell-related command")
-    | fields _time host user hunt details NewProcessName ParentProcessName Process_Command_Line
-]
-
-| append [
-    search index=windows host IN ("SERVER01","SERVER02","DC01","JUMP01") (EventCode=7045 OR EventCode=4697)
-    | eval hunt="02 - Service creation",
-           user=coalesce(user, SubjectUserName, Account_Name, "Unknown"),
-           details=coalesce(ServiceName, ServiceFileName, ImagePath, "Service created")
-    | fields _time host user hunt details ServiceName ServiceFileName ImagePath
-]
-
-| append [
-    search index=windows host IN ("SERVER01","SERVER02","DC01","JUMP01") EventCode=4698
-    | eval hunt="03 - Scheduled task creation",
-           user=coalesce(user, SubjectUserName, Account_Name, "Unknown"),
-           details=coalesce(TaskName, TaskContent, "Scheduled task created")
-    | fields _time host user hunt details TaskName TaskContent
-]
-
-| append [
-    search index=windows host IN ("SERVER01","SERVER02","DC01","JUMP01") (EventCode=4732 OR EventCode=4733)
-    | eval hunt="04 - Local group membership change",
-           user=coalesce(SubjectUserName, user, Account_Name, "Unknown"),
-           details=coalesce(MemberName, TargetUserName, "Group membership changed")
-    | fields _time host user hunt details MemberName TargetUserName
-]
-
-| append [
-    search index=windows host IN ("SERVER01","SERVER02","DC01","JUMP01") EventCode=4688
-        (NewProcessName="*\\rundll32.exe" OR NewProcessName="*\\procdump.exe" OR NewProcessName="*\\nanodump.exe" OR Process_Command_Line="*comsvcs.dll*")
-    | eval hunt="05 - Possible credential-access tooling",
-           user=coalesce(user, SubjectUserName, Account_Name, "Unknown"),
-           details=coalesce(Process_Command_Line, NewProcessName, "Potential credential-access process")
-    | fields _time host user hunt details NewProcessName ParentProcessName Process_Command_Line
-]
-
-| append [
-    search index=windows host IN ("SERVER01","SERVER02","DC01","JUMP01") (EventCode=1102 OR EventCode=104)
-    | eval hunt="06 - Security or event log cleared",
-           user=coalesce(SubjectUserName, user, Account_Name, "Unknown"),
-           details=coalesce(Provider_Name, Channel, "Windows event log cleared")
-    | fields _time host user hunt details EventCode Provider_Name Channel
-]
-
-| append [
-    search index=windows host IN ("SERVER01","SERVER02","DC01","JUMP01") EventCode=4624 (LogonType=3 OR LogonType=10)
-    | eval hunt="07 - Remote logon",
-           user=coalesce(TargetUserName, user, Account_Name, "Unknown"),
-           details="LogonType=".LogonType." SourceIP=".coalesce(IpAddress, Source_Network_Address, "Unknown")
-    | fields _time host user hunt details LogonType IpAddress Source_Network_Address WorkstationName
-]
-
-| append [
-    search index=windows host IN ("SERVER01","SERVER02","DC01","JUMP01") EventCode=4663
-        (ObjectName="*.php" OR ObjectName="*.aspx" OR ObjectName="*.jsp")
-    | eval hunt="08 - Web-server file access",
-           user=coalesce(SubjectUserName, user, Account_Name, "Unknown"),
-           details=coalesce(ObjectName, "Web file accessed")
-    | fields _time host user hunt details ObjectName ProcessName AccessMask
-]
-
-| append [
-    search index=windows host IN ("SERVER01","SERVER02","DC01","JUMP01") EventCode=4720
-    | eval hunt="09 - User account created",
-           user=coalesce(SubjectUserName, user, Account_Name, "Unknown"),
-           details=coalesce(TargetUserName, "New account created")
-    | fields _time host user hunt details TargetUserName
-]
-
-| append [
-    search index=sysmon host IN ("SERVER01","SERVER02","DC01","JUMP01") EventCode=3
-    | eval hunt="10 - Outbound network connections",
-           user=coalesce(user, User, "Unknown"),
-           details="Image=".coalesce(Image, "Unknown")." Destination=".coalesce(DestinationIp, DestinationHostname, "Unknown").":".coalesce(tostring(DestinationPort), "Unknown")
-    | fields _time host user hunt details Image DestinationIp DestinationHostname DestinationPort Protocol
-]
-
-| eval host=coalesce(host, Computer, ComputerName, "Unknown"),
-       user=coalesce(user, "Unknown"),
-       details=coalesce(details, "No detail extracted")
-| table _time host user hunt details NewProcessName ParentProcessName Process_Command_Line ServiceName ServiceFileName ImagePath TaskName TaskContent MemberName TargetUserName LogonType IpAddress Source_Network_Address ObjectName ProcessName AccessMask Image DestinationIp DestinationHostname DestinationPort Protocol
-| sort 0 - _time
-2. What each hunt is looking for
-|# |Hunt                     |Primary telemetry                                      |What to investigate                                               | |--|-------------------------|-------------------------------------------------------|------------------------------------------------------------------| |01|Suspicious PowerShell    |Security 4688; ideally PowerShell 4104 and Sysmon 1 too|Encoded commands, download activity, unusual parent process       | |02|Service creation         |System 7045; Security 4697                             |Unexpected service binary, unusual path, unexpected creator       | |03|Scheduled task creation  |Security 4698; Task Scheduler operational logs         |New task, unusual trigger, script or binary launched              | |04|Local group membership   |Security 4732 / 4733                                   |Unexpected account added to or removed from a local security group| |05|Credential-access tooling|Security 4688; Sysmon 1 and 10                         |Suspicious process execution or LSASS access                      | |06|Log clearing             |Security 1102; System 104                              |Unexpected clearing of Security or other event logs               | |07|Remote logon             |Security 4624                                          |Unusual source, account, time, server or logon type               | |08|Web-server file activity |Security 4663; Sysmon 11                               |Unexpected script file access or creation in a web root           | |09|Account creation         |Security 4720                                          |Unexpected account, creator or timing                             | |10|Outbound connections     |Sysmon 3 or equivalent network telemetry               |Server process connecting to unusual destinations or ports        |
-3. Important field and telemetry assumptions
-	●	Windows Security events: The example assumes Windows events are searchable in index=windows and that EventCode is extracted.
-	●	Sysmon: Hunt 10 assumes Sysmon network connection events are in index=sysmon. If Sysmon is stored in the Windows index, change the relevant branch.
-	●	Process command line: 4688 command-line collection must be enabled. Field names vary by TA/CIM mapping; common alternatives include CommandLine, Process_Command_Line, NewProcessName and ParentProcessName.
-	●	Service creation: Event 7045 is a System log event. Event 4697 is a Security audit event and requires the relevant audit policy.
-	●	File access: Event 4663 requires file-system auditing and suitable SACLs. It does not automatically mean a file was created. Sysmon Event 11 is useful for file creation.
-	●	Credential access: Process-name matching is only a lead. Stronger LSASS-access hunting needs suitable process-access telemetry, such as Sysmon Event 10 or EDR telemetry.
-	●	Host filtering: The sample uses exact host values. If you want all hosts, remove the host IN (...) clause from each branch. Use the actual host field your data uses.
-4. False-positive handling and investigation
-Do not treat a match as proof of compromise. For each result:
-	1.	Confirm the host’s role and owner (domain controller, jump server, web server, application server, etc.).
-	2.	Validate the account, parent process, command line, binary path, signature and expected administrative activity.
-	3.	Compare the event time with change windows, deployment jobs and approved maintenance.
-	4.	Pivot on the host, user and time window to find related logons, process creation, group changes, scheduled tasks and network connections.
-	5.	Correlate with EDR alerts, DNS, proxy, firewall and identity telemetry where available.
-	6.	Document the evidence and disposition; escalate according to your SOC process if activity is unexplained.
-5. Practical tuning recommendations
-	●	Start with one or two hosts and a short time range to validate the query.
-	●	Confirm the correct index and field names using | fieldsummary or by inspecting raw events.
-	●	Add known administration tools and approved service accounts to documented allowlists only after validating their normal behaviour.
-	●	Consider converting high-confidence, well-tested hunts into detections with risk scoring, suppression and alert context.
-	●	The append subsearches are subject to Splunk subsearch limits and can be expensive. For large environments or high-volume time ranges, consider separate scheduled searches or a data-model-based approach.
-6. Quick validation searches
-Check which event codes exist for a host:
-index=windows host="SERVER01"
-| stats count by EventCode
-| sort - count
-Check actual process field names:
-index=windows host="SERVER01" EventCode=4688
-| head 20
-| table _time host *
-Check Sysmon network events:
-index=sysmon host="SERVER01" EventCode=3
-| head 20
-| table _time host *
+Windows Explicit Credential Usage & Service Account Threat-Hunting Playbook
+Splunk investigation guide — process-independent
+Purpose
+Use this playbook when a Splunk alert or hunt identifies Explicit Credentials Used (commonly Windows Security Event ID 4648), and an employee account appears to have supplied a separate service account, such as a backup account.
+This guide deliberately does not assume a particular executable or process name. Start with the raw event and investigate whichever process is actually recorded.
+Investigation questions
+	1.	Which user initiated the activity?
+	2.	Which alternate/service account was supplied?
+	3.	Which process and process ID are recorded?
+	4.	What launched that process?
+	5.	On which endpoint did it run?
+	6.	Which destination server or service was targeted?
+	7.	Did authentication succeed?
+	8.	Where else was the service account used?
+	9.	Is there evidence explaining how the credentials were supplied or accessed?
+	10.	Was the activity approved and expected?
+> **Important:** Event ID 4648 records an attempt to use explicitly > supplied credentials. It does not, by itself, prove credential theft, > reveal where a password came from, or prove that authentication > succeeded. A process name alone is not enough to determine whether > activity is benign or malicious.
 ￼
-Hunting note: This consolidated search is designed for triage and exploration. It is not a substitute for enabling the required audit policies or collecting endpoint telemetry. A hunt that returns no events may indicate missing data rather than absence of attacker activity.
+1. Understand the important Windows events
+￼
+Event ID                Event                   Investigative value
+￼
+4648                    A logon was attempted   Subject account, target using explicit          account, process and credentials             intended target details, when available
+4624                    Successful logon        Authentication success, logon type, source information and logon ID
+4625                    Failed logon            Failed authentication, status/substatus and source details
+4688                    Process creation        New process, creator/parent context and command line if auditing is configured
+4672                    Special privileges      Privileges associated assigned to new logon   with a logon session
+4634                    Logoff                  Logon session ended
+4647                    User initiated logoff   User-initiated session termination
+4697                    Service installed       Service installation evidence
+7045                    Service installed       Service name, image (System log)            path and service account information
+4698                    Scheduled task created  Potential automation or persistence
+4702                    Scheduled task updated  Changes to scheduled tasks
+4768                    Kerberos TGT requested  Kerberos authentication context
+4769                    Kerberos service ticket Service/SPN access requested               context
+4776                    NTLM credential         NTLM validation validation              activity
+4728 / 4732 / 4756      Member added to         Possible privilege or security-enabled group  group membership changes
+4729 / 4733 / 4757      Member removed from     Group membership security-enabled group  changes
+Event collection depends on Windows audit policy, operating-system version, Splunk inputs and field extractions. Validate event content in _raw.
+￼
+2. Begin with Event ID 4648 — do not assume the process
+Use a suitable index and time range for your environment.
+index=* EventCode=4648
+| table _time host ComputerName
+        SubjectDomainName SubjectUserName
+        TargetDomainName TargetUserName
+        ProcessName ProcessId
+        TargetServerName IpAddress
+        LogonGuid _raw
+| sort - _time
+If you know the service account, filter on it:
+index=* EventCode=4648
+| search TargetUserName="<BACKUP_ACCOUNT>"
+| table _time host SubjectDomainName SubjectUserName
+        TargetDomainName TargetUserName
+        ProcessName ProcessId TargetServerName
+        IpAddress LogonGuid _raw
+| sort - _time
+Interpret the fields
+￼
+Field                               Meaning / caution
+￼
+host / ComputerName             System that recorded the event; usually the endpoint where the process ran
+SubjectUserName                   Account whose security context initiated the action
+TargetUserName                    Alternate account whose credentials were supplied
+ProcessName                       Process associated with the explicit-credentials attempt
+ProcessId                         Process identifier; compare with process creation telemetry
+TargetServerName                  Intended target server, if populated
+IpAddress                         May be blank or unavailable in Event 4648
+LogonGuid                         Can help correlate related authentication events when populated
+The subject and target account may be different. Confirm the domain, account spelling and event details before drawing conclusions.
+Inspect the raw event
+index=* EventCode=4648
+| search TargetUserName="<BACKUP_ACCOUNT>"
+| table _time host source sourcetype _raw
+| sort - _time
+Raw event content is important when field extractions are incomplete or inconsistent.
+￼
+3. Identify every process associated with the activity
+Do not filter on a guessed process name. First list all process names seen in Event 4648 for the relevant accounts.
+index=* EventCode=4648
+| search TargetUserName="<BACKUP_ACCOUNT>"
+| stats count
+        values(ProcessName) as ProcessNames
+        values(ProcessId) as ProcessIDs
+        values(TargetServerName) as Destinations
+        values(host) as SourceHosts
+        min(_time) as first_seen
+        max(_time) as last_seen
+        by SubjectUserName TargetUserName
+| convert ctime(first_seen) ctime(last_seen)
+For a time-ordered event-level view:
+index=* EventCode=4648
+| search TargetUserName="<BACKUP_ACCOUNT>"
+| table _time host SubjectUserName TargetUserName
+        ProcessName ProcessId TargetServerName IpAddress
+| sort _time
+Check whether the process name is: - Fully qualified or only a filename. - Truncated or misspelled in the alert display. - Extracted from the correct raw event field. - Consistent across events on the same endpoint. - Different across multiple attempts.
+Do not infer executable identity from a shortened alert label. Use the raw event and endpoint process telemetry to verify it.
+￼
+4. Find process creation and the parent process — Event ID 4688
+Event 4688 may show what process was created and, if the relevant audit settings are enabled, the creator process and command line.
+Start with the source host and a time window around Event 4648:
+index=* EventCode=4688 host="<SOURCE_HOST>"
+| table _time host SubjectUserName
+        NewProcessName NewProcessId
+        CreatorProcessName CreatorProcessId
+        ParentProcessName CommandLine _raw
+| sort _time
+Field names vary by Windows TA and data model. Some environments use ProcessName, ProcessId, Creator_Process_Name or other names. Inspect _raw if fields are missing.
+Search by process name after obtaining it from Event 4648
+index=* EventCode=4688
+| search NewProcessName="*<PROCESS_FILENAME>*"
+| table _time host SubjectUserName
+        NewProcessName NewProcessId
+        CreatorProcessName CreatorProcessId
+        ParentProcessName CommandLine
+| sort - _time
+Correlate using the process ID
+Use the process ID from Event 4648 and search the same host around the same timestamp:
+index=* EventCode=4688 host="<SOURCE_HOST>"
+| search NewProcessId="<PROCESS_ID>"
+| table _time host SubjectUserName
+        NewProcessName NewProcessId
+        CreatorProcessId CreatorProcessName
+        ParentProcessName CommandLine _raw
+| sort _time
+PID caution: Windows process IDs may be represented in hexadecimal in raw events and decimal in other telemetry. Compare raw values and normalise formats if needed. PIDs are reused, so correlate by host and a narrow time window as well as PID.
+What parent-process evidence can suggest
+￼
+Parent / launcher example           Possible explanation to validate
+￼
+services.exe                      Service-launched activity
+taskeng.exe / taskhostw.exe     Scheduled task activity
+PowerShell host                     Script or automation activity
+Command shell                       Command-line-launched activity
+Desktop shell                       Interactive user launch
+Approved backup or management agent Potentially expected automation
+Unknown or unexpected parent        Requires further investigation
+These are leads, not proof. Confirm with process command line, software inventory, owner and endpoint telemetry.
+￼
+5. Determine whether the alternate account authenticated successfully
+Successful logons — Event ID 4624
+index=* EventCode=4624
+| search TargetUserName="<BACKUP_ACCOUNT>"
+| table _time host TargetDomainName TargetUserName
+        LogonType IpAddress WorkstationName
+        AuthenticationPackageName LogonProcessName
+        TargetLogonId LogonGuid _raw
+| sort - _time
+Failed logons — Event ID 4625
+index=* EventCode=4625
+| search TargetUserName="<BACKUP_ACCOUNT>"
+| table _time host TargetUserName
+        LogonType IpAddress WorkstationName
+        Status SubStatus AuthenticationPackageName _raw
+| sort - _time
+Common logon types
+Logon type   Meaning
+￼
+2            Interactive logon 3            Network logon 4            Batch logon 5            Service logon 7            Workstation unlock 8            NetworkCleartext 9            NewCredentials 10           RemoteInteractive, commonly Remote Desktop 11           CachedInteractive
+A logon type is context, not a verdict. For example, type 3 is common for network access and does not by itself indicate lateral movement.
+A 4648 event may be related to a NewCredentials logon, but do not expect every 4648 to have a matching 4624 in the same host’s logs. Authentication records may be generated on a different system, and telemetry may be incomplete.
+￼
+6. Find all systems where the service account was used
+Search across the relevant Windows indexes for the account.
+index=* (EventCode=4624 OR EventCode=4625 OR EventCode=4648)
+| search TargetUserName="<BACKUP_ACCOUNT>"
+| stats count
+        values(EventCode) as EventIDs
+        values(LogonType) as LogonTypes
+        values(IpAddress) as SourceIPs
+        values(WorkstationName) as Workstations
+        values(ProcessName) as Processes
+        min(_time) as first_seen
+        max(_time) as last_seen
+        by host TargetUserName
+| convert ctime(first_seen) ctime(last_seen)
+| sort - count
+Use the results to identify: - Systems where the service account authenticated. - Unexpected source workstations or destination hosts. - Use outside normal backup windows. - Multiple users or processes using the same account. - Sudden changes in the account’s normal activity.
+Field names differ between event types. Check the raw event and do not assume TargetUserName is populated consistently in all sources.
+Build an account activity timeline
+index=* (EventCode=4624 OR EventCode=4625 OR EventCode=4648)
+| search TargetUserName="<BACKUP_ACCOUNT>"
+| table _time host EventCode SubjectUserName
+        TargetUserName ProcessName TargetServerName
+        LogonType IpAddress WorkstationName Status SubStatus
+| sort _time
+￼
+7. Investigate the destination and authentication protocol
+Network logons — Event ID 4624, type 3
+index=* EventCode=4624 LogonType=3
+| search TargetUserName="<BACKUP_ACCOUNT>"
+| table _time host TargetUserName IpAddress
+        WorkstationName AuthenticationPackageName
+        TargetLogonId LogonGuid
+| sort - _time
+Kerberos service-ticket requests — Event ID 4769
+index=* EventCode=4769
+| search TargetUserName="<BACKUP_ACCOUNT>"
+| table _time host TargetUserName ServiceName
+        ServiceSid IpAddress TicketEncryptionType
+        Status _raw
+| sort - _time
+Look for unexpected service names/SPNs, destinations, source addresses and unusual timing. Validate field availability and semantics for your Windows version.
+NTLM validation — Event ID 4776
+index=* EventCode=4776
+| search TargetUserName="<BACKUP_ACCOUNT>"
+| table _time host TargetUserName Workstation Status _raw
+| sort - _time
+Domain controllers may record credential validation while the destination resource server records the logon. Events can therefore appear on different hosts.
+Additional data sources
+If available and authorised, review: - EDR process and network telemetry. - DNS queries. - Firewall connection logs. - Proxy and remote-access logs. - SMB/file-server auditing. - Backup platform job history. - Application logs. - Task Scheduler operational logs. - Windows service installation and modification logs.
+￼
+8. Investigate how the credentials may have been supplied
+Event 4648 does not record the password’s origin. It usually cannot distinguish between a person typing a password, an application using a stored credential, a script passing credentials, a password vault providing credentials, or another approved mechanism.
+Use supporting evidence. Do not attempt to retrieve or expose secret values.
+A. PowerShell logging — Events 4103 and 4104
+index=* (EventCode=4103 OR EventCode=4104)
+| search "<BACKUP_ACCOUNT>"
+| table _time host UserID ScriptBlockText Message _raw
+| sort - _time
+Potential command names or APIs to look for include: - Get-Credential - PSCredential - ConvertTo-SecureString - Start-Process with credential parameters - Invoke-Command with credential parameters - New-PSDrive with credential parameters - cmdkey - runas
+These strings are investigation leads. Their presence alone does not prove misuse.
+B. Stored credentials and Credential Manager
+If endpoint telemetry is available, check for: - Credential Manager activity. - Saved-credential changes. - Credential-management utilities. - Vault or secret-management client activity. - Relevant process access and file metadata.
+Do not collect passwords, tokens, private keys or secret values into Splunk.
+C. Scripts, configuration and application access
+If authorised file and endpoint telemetry exists, investigate whether the process or its parent accessed: - Backup scripts (.ps1, .bat, .cmd). - Application configuration files. - Scheduled-task definitions. - Backup-agent configuration. - Secret-management client configuration.
+Record file path, access time, process and user where possible. Do not expose sensitive file contents or secrets in the case notes.
+D. PAM / password vault audit records
+If your organisation uses privileged access management or a password vault, check: - Which user checked out or requested the backup account. - Whether approval was required and granted. - Checkout and return timestamps. - Managed account and target system. - Password reveal or rotation audit events. - Session recording or command audit, where authorised.
+A PAM audit trail may provide the best evidence of who accessed a managed service account and when.
+￼
+9. Check privilege and account changes
+Special privileges — Event ID 4672
+index=* EventCode=4672
+| search SubjectUserName="<BACKUP_ACCOUNT>"
+| table _time host SubjectUserName SubjectDomainName
+        SubjectLogonId PrivilegeList _raw
+| sort - _time
+Correlate SubjectLogonId with the relevant 4624 on the same host. Special privileges can be normal for certain service accounts; compare against expected configuration.
+Group membership changes
+index=* (EventCode=4728 OR EventCode=4732 OR EventCode=4756
+         OR EventCode=4729 OR EventCode=4733 OR EventCode=4757)
+| table _time host EventCode SubjectUserName
+        MemberName TargetUserName GroupName _raw
+| sort - _time
+Check whether the service account or initiating user was added to or removed from privileged groups. Confirm field names from raw events.
+Service installation — Events 4697 and 7045
+index=* (EventCode=4697 OR EventCode=7045)
+| table _time host EventCode ServiceName
+        ImagePath ServiceType StartType AccountName _raw
+| sort - _time
+Investigate unexpected services, image paths, service accounts or installation times.
+Scheduled tasks — Events 4698 and 4702
+index=* (EventCode=4698 OR EventCode=4702)
+| table _time host EventCode SubjectUserName
+        TaskName TaskContent _raw
+| sort - _time
+Field availability varies. Review task name, run-as account, executable, arguments, trigger and creation/modification context.
+￼
+10. Build a correlated timeline
+Start with the 4648 timestamp. Search the source host around the event, for example 10 minutes before and after. Expand the window if necessary.
+index=* host="<SOURCE_HOST>" earliest="<START_TIME>" latest="<END_TIME>"
+| eval event_id=coalesce(EventCode, EventID)
+| where event_id IN (4624,4625,4648,4688,4672,4634,4647,4697,4698,4702,7045)
+| table _time event_id host SubjectUserName TargetUserName
+        ProcessName ProcessId NewProcessName NewProcessId
+        ParentProcessName CreatorProcessName CommandLine
+        TargetServerName IpAddress LogonType
+        TargetLogonId SubjectLogonId _raw
+| sort _time
+Replace the placeholders with valid time values or use the Splunk time picker. Some environments use EventID instead of EventCode.
+Correlation guidance
+	●	Use host + timestamp + process ID to correlate process creation.
+	●	Use logon ID to correlate 4624 and 4672 on the same computer.
+	●	Use Logon GUID when populated and consistent.
+	●	Compare source workstation/IP with destination-host logon records.
+	●	Allow for clock skew and ingestion delays.
+	●	Avoid joining on username alone: service accounts can have many simultaneous sessions.
+	●	Confirm PID format and account for PID reuse.
+	●	A missing event is not proof that an activity did not happen; logging may be disabled or data may not be ingested.
+￼
+11. Validate the executable and application
+Once the process is confirmed from raw event and endpoint telemetry, assess it without assuming it is malicious.
+Collect, where available: 1. Full executable path. 2. SHA-256 hash. 3. Digital signature and signer. 4. File version and product name. 5. File creation and modification timestamps. 6. Parent process and full command line. 7. User context and integrity level. 8. Network connections initiated by the process. 9. Whether the binary exists on other managed endpoints. 10. Whether the hash, path and version match approved software inventory. 11. Application owner and expected purpose.
+Useful endpoint fields
+Depending on EDR, Sysmon or Windows process telemetry: - Image / NewProcessName - CommandLine - ParentImage / ParentProcessName - ParentCommandLine - Hashes - User - ProcessGuid - ProcessId - DestinationIp - DestinationPort
+If Sysmon is installed and collected: - Event ID 1: Process creation. - Event ID 3: Network connection, if network connection logging is enabled.
+Do not execute an unknown binary just to see what it does. Use approved endpoint investigation and malware-analysis procedures.
+￼
+12. Baseline expected service-account behaviour
+Ask the system owner or compare with historical telemetry:
+	●	Which hosts should this account access?
+	●	Which source systems should use it?
+	●	Which applications or scheduled jobs are expected to use it?
+	●	What is the approved operating window?
+	●	Which logon types are normal?
+	●	Which authentication protocols are expected?
+	●	Is interactive or remote desktop logon permitted?
+	●	Is the account managed by PAM or a password vault?
+	●	When was the password last rotated?
+	●	Is the account shared by multiple systems or teams?
+	●	Is there an approved change, maintenance window or backup job?
+A deviation from baseline is a reason to investigate, not automatic proof of compromise.
+￼
+13. Suspicious indicators to assess
+Investigate further when supported by evidence such as: - A human user using a service account outside their role. - A backup account authenticating to an unexpected server. - Use outside the normal backup or maintenance window. - A process or parent process inconsistent with the application’s normal operation. - Execution from a temporary or user-writable directory without a valid business reason. - An unsigned or unexpected binary, or a hash inconsistent with approved software. - A burst of failed logons followed by a success. - Interactive or remote interactive logon for an account intended only for services. - Unexpected service installation or scheduled-task creation. - Privileged group membership changes. - Connections to unusual systems or addresses. - No corresponding approved PAM checkout, change request or backup job. - Use of the service account from multiple unexpected endpoints.
+These are risk indicators, not conclusive proof. Validate against known-good operations and corroborating telemetry.
+￼
+14. Investigation worksheet
+￼
+Question                            Evidence to record
+￼
+Who initiated the activity?         Subject account/domain from 4648
+Which alternate account was         Target account/domain from 4648 supplied?
+Which process was associated with   Exact ProcessName and ProcessId it?                                 from raw 4648
+What launched the process?          Parent image, parent PID and command line from 4688/EDR
+Where did the process run?          Source host from 4648 and process telemetry
+What was the intended target?       TargetServerName, if populated
+Did authentication succeed?         Related 4624 or failure evidence from 4625
+What was the logon type?            LogonType from 4624
+Where else was the account used?    4624, 4625, 4769, 4776 and EDR/network evidence
+How might credentials have been     PAM/vault audit, script/config supplied?                           access, application logs; may remain unknown
+Was activity authorised?            Change ticket, backup schedule, application owner, PAM approval
+What happened afterwards?           Process, network, file, service, task and privilege activity
+￼
+15. Questions for the application / system owner
+	1.	Is the process recorded in Event 4648 an approved application or internal utility?
+	2.	Which team owns and supports it?
+	3.	What is its expected installation path, signer and hash?
+	4.	Is it expected to use the backup service account?
+	5.	Which destination servers or services should it access?
+	6.	Is the activity expected at this date and time?
+	7.	Is the service account supplied by PAM/vault, a managed service, an application configuration or another approved mechanism?
+	8.	Is there an associated change request, backup job or maintenance window?
+	9.	Should the initiating user be authorised to use this service account?
+	10.	Are there application logs or session records that can confirm the operation?
+￼
+16. Suggested SOC case-note wording
+> Windows Security Event ID 4648 recorded an attempt by > `[SUBJECT_ACCOUNT]` on `[SOURCE_HOST]` to use explicit credentials for > `[TARGET_ACCOUNT]` at `[TIMESTAMP]`. The event recorded process > `[EXACT_PROCESS_PATH_OR_NOT_CONFIRMED]` and process ID > `[PROCESS_ID_OR_NOT_AVAILABLE]`. The event identifies an > explicit-credentials attempt but does not establish the origin of the > credentials or confirm successful authentication. Further > investigation is being conducted to identify the parent process and > command line, intended destination, subsequent authentication events, > service-account activity across the environment, and relevant > PAM/vault or application audit records. The activity will be assessed > against the approved use and expected operating schedule of the > service account.
+Possible outcome categories
+	●	Expected / authorised: Evidence matches an approved application, account owner, destination and operational schedule.
+	●	Unusual but explained: Activity differs from baseline but is confirmed by the system owner and supported by records.
+	●	Suspicious / requires escalation: Evidence conflicts with approved use, or corroborating indicators suggest unauthorised activity.
+	●	Inconclusive: Available telemetry is insufficient to establish process, destination, credential source or authorisation.
+￼
+17. Recommended SOC workflow
+	1.	Preserve the original 4648 event, raw XML and alert context.
+	2.	Record source host, subject account, target account, process path, PID and timestamp.
+	3.	Verify the exact process name from raw event data; do not rely on an alert label alone.
+	4.	Find matching 4688/EDR process creation telemetry.
+	5.	Identify parent process, command line, signer, hash and application owner.
+	6.	Establish the intended destination from 4648 and validate it using destination-host and network logs.
+	7.	Search 4624 and 4625 for success/failure and logon type.
+	8.	Search across the environment for use of the service account.
+	9.	Review Kerberos and NTLM authentication events.
+	10.	Review PowerShell, scheduled-task, service, application and backup logs.
+	11.	Check PAM/vault records and approved change/backup schedules.
+	12.	Build a timestamped timeline and document gaps in telemetry.
+	13.	Escalate or contain according to the organisation’s incident-response process if evidence supports unauthorised use.
+￼
+Final reminders
+	●	Do not assume a process name before validating the raw event.
+	●	Do not assume Event 4648 means the authentication succeeded.
+	●	Do not assume the destination is known if TargetServerName is blank.
+	●	Do not assume the password was stolen or knowable from Event 4648.
+	●	Do not expose passwords, tokens, private keys or other secret values in Splunk results or case notes.
+	●	Use host, timestamp, process ID, logon ID and corroborating telemetry to build the timeline.
+	●	Assess the activity against approved service-account behaviour and confirm with the account/application owner.
