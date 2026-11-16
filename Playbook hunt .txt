@@ -1,0 +1,455 @@
+Advanced Threat Hunting Playbook
+RDP Credential Usage, Jump Box Access & Privileged Account Validation
+Platform: Splunk Enterprise / Splunk ES Log sources: Windows Security, Sysmon, Windows Terminal Services, EDR Primary investigation: RDP access using an alternate or privileged account MITRE ATT&CK: T1021.001 – Remote Services: Remote Desktop Protocol; T1078 – Valid Accounts
+￼
+1. Investigation objectives
+Establish:
+	1.	Which user initiated the RDP connection?
+	2.	Which process launched Remote Desktop?
+	3.	What hostname or IP address did the user enter?
+	4.	Which username was supplied to the credential interface?
+	5.	Was the username different from the user’s logged-on account?
+	6.	Did authentication succeed?
+	7.	Which destination server accepted the connection?
+	8.	Was the account privileged or a service account?
+	9.	What activity occurred after authentication?
+	10.	Was the activity consistent with authorised administration?
+Evidence classification
+Evidence                What it establishes
+￼
+Process creation        RDP client was launched RDP Client Event 1024   Destination hostname/IP attempted RDP Client Event 1029   Username hash, where present Security Event 4648     Explicit credentials were used, if generated Security Event 1149     RDP authentication event Security Event 4624     Successful Windows logon Security Event 4672     Special privileges assigned Security Event 4688     Processes executed
+Principle: Separate what was entered, what was attempted, what authenticated and what executed. These are different evidence points. Process execution alone does not prove credential usage.
+2. Establish investigation parameters
+Collect:
+	●	Source workstation
+	●	Original interactive username
+	●	Suspected service account
+	●	Approximate event timestamp
+	●	Destination jump box, if known
+	●	Relevant domain
+	●	Splunk time zone
+Use a window of at least 10 minutes before and 20 minutes after the initial RDP activity.
+Illustrative values:
+Source host: WORKSTATION01
+Initiating user: user01
+Suspected account: svc_admin
+Time: 2026-11-16 14:30:00
+Destination: UNKNOWN
+These are examples, not investigation findings.
+3. Hunt 1 – Identify RDP process execution
+Objective: Establish whether Explorer launched MSTSC and identify associated process information.
+Query 1A – Windows process creation
+index=* EventCode=4688 earliest=-24h
+(
+    NewProcessName="*\\mstsc.exe"
+    OR NewProcessName="*\\CredentialUIBroker.exe"
+)
+| table _time Computer SubjectUserName
+    NewProcessName NewProcessId
+    CreatorProcessName ProcessId CommandLine
+| sort 0 _time
+Query 1B – Parent-child process relationships
+index=* EventCode=4688 earliest=-24h
+| eval child=lower(NewProcessName)
+| eval parent=lower(CreatorProcessName)
+| where like(child,"%mstsc.exe%")
+    OR like(child,"%credentialuibroker.exe%")
+| table _time Computer SubjectUserName
+    parent child ProcessId NewProcessId CommandLine
+| sort 0 _time
+Investigate:
+	●	Was MSTSC launched by Explorer?
+	●	Was the process running under the expected user?
+	●	Was MSTSC launched from the normal Windows directory?
+	●	Was the command line unusual?
+	●	Was MSTSC launched multiple times?
+	●	Did another process launch MSTSC?
+Caution: CredentialUIBroker.exe does not establish which credentials were entered. Its process command line is not a reliable source for recovering the username or password.
+4. Hunt 2 – Recover the destination hostname
+Priority: Critical
+Event source:
+Microsoft-Windows-TerminalServices-RDPClient/Operational
+Event ID 1024
+The RDP client can record the destination server it attempts to connect to.
+Query 2A – Find RDP destination events
+index=* EventCode=1024 earliest=-24h
+| table _time Computer User UserID EventCode Message _raw
+| sort 0 _time
+Query 2B – Extract destination from XML
+If the event XML contains a Data element named Name:
+index=* EventCode=1024 earliest=-24h
+| rex field=_raw "(?i)<Data Name=['\"]Name['\"]>(?<RDP_Destination>[^<]+)"
+| table _time Computer User RDP_Destination Message
+| sort 0 _time
+Inspect _raw and adjust the extraction to match the actual XML structure and field names in your environment.
+Query 2C – Search the known source workstation
+index=* EventCode=1024 Computer="WORKSTATION01" earliest=-24h
+| table _time Computer User Message _raw
+| sort 0 _time
+Potential destinations may look like:
+JUMPBOX01
+JUMPBOX01.company.local
+10.10.20.15
+Interpretation: Event 1024 is evidence of an attempted destination, not proof that the connection succeeded. Correlate it with authentication events on the destination.
+5. Hunt 3 – Validate the username supplied
+Priority: Critical
+Event ID 4648 – Explicit credentials
+Review these fields where available:
+	●	SubjectUserName
+	●	SubjectDomainName
+	●	TargetUserName
+	●	TargetDomainName
+	●	TargetServerName
+	●	ProcessName
+	●	ProcessId
+	●	SubjectLogonId
+	●	IpAddress
+Query 3A – Search explicit credential usage
+index=* EventCode=4648 earliest=-24h
+| table _time Computer
+    SubjectUserName SubjectDomainName
+    TargetUserName TargetDomainName
+    TargetServerName TargetInfo
+    ProcessName ProcessId
+    SubjectLogonId IpAddress
+| sort 0 _time
+Query 3B – Find the suspected service account
+index=* EventCode=4648 TargetUserName="svc_admin" earliest=-24h
+| table _time Computer
+    SubjectUserName SubjectDomainName
+    TargetUserName TargetDomainName
+    TargetServerName ProcessName ProcessId
+    IpAddress
+| sort 0 _time
+Query 3C – Identify alternate account usage
+index=* EventCode=4648 earliest=-24h
+| where isnotnull(SubjectUserName)
+    AND isnotnull(TargetUserName)
+    AND lower(SubjectUserName)!=lower(TargetUserName)
+| table _time Computer
+    SubjectUserName TargetUserName
+    SubjectDomainName TargetDomainName
+    TargetServerName ProcessName ProcessId
+| sort 0 _time
+Example interpretation:
+SubjectUserName: user01
+TargetUserName: svc_admin
+TargetDomainName: COMPANY
+TargetServerName: JUMPBOX01
+ProcessName: C:\Windows\System32\mstsc.exe
+This would support the conclusion that the original user context used or attempted to use an alternate account.
+Caution: Event 4648 is not guaranteed for every RDP credential prompt. Its absence does not prove that alternate credentials were not supplied. Also verify whether the process and target fields actually correspond to the RDP event being investigated.
+6. Hunt 4 – Investigate the RDP username hash
+Event ID 1029
+The RDP client may record a Base64-encoded SHA-256 username hash.
+Query 4A – Retrieve username hash events
+index=* EventCode=1029 earliest=-24h
+| table _time Computer User Message _raw
+| sort 0 _time
+Validation methodology
+	1.	Identify the candidate service account.
+	2.	Obtain the hash from Event 1029.
+	3.	Calculate SHA-256 for the candidate username.
+	4.	Encode the resulting hash in Base64.
+	5.	Compare against the event value, after confirming the precise input format and encoding.
+Important:
+	●	This is not password telemetry.
+	●	A hash cannot be directly reversed to recover the username.
+	●	Confirm the exact hash input format before treating a match as conclusive.
+	●	Event 1029 is supporting evidence, not a replacement for authentication logs.
+7. Hunt 5 – Validate RDP authentication
+Priority: Critical
+Event source:
+Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational
+Event ID 1149
+This records an RDP authentication event and can help identify the account and source address.
+Query 5A – Find RDP authentication events
+index=* EventCode=1149 earliest=-24h
+| table _time Computer User Domain Address Message _raw
+| sort 0 _time
+Query 5B – Find the suspected service account
+index=* EventCode=1149 User="svc_admin" earliest=-24h
+| table _time Computer User Domain Address Message
+| sort 0 _time
+Check raw event data if your field names differ.
+8. Hunt 6 – Confirm successful Windows logon
+Event ID 4624
+For a conventional RDP interactive session, investigate Logon Type 10.
+Query 6A – Successful RDP logons
+index=* EventCode=4624 LogonType=10 earliest=-24h
+| table _time Computer
+    TargetUserName TargetDomainName
+    LogonType IpAddress WorkstationName
+    AuthenticationPackageName TargetLogonId
+| sort 0 _time
+Query 6B – Confirm service account access
+index=* EventCode=4624 LogonType=10 TargetUserName="svc_admin" earliest=-24h
+| table _time Computer
+    TargetUserName TargetDomainName
+    IpAddress WorkstationName
+    TargetLogonId AuthenticationPackageName
+| sort 0 _time
+Query 6C – Find accounts using RDP from the source workstation
+index=* EventCode=4624 LogonType=10 WorkstationName="WORKSTATION01" earliest=-24h
+| stats count
+    earliest(_time) as FirstSeen
+    latest(_time) as LastSeen
+    values(TargetUserName) as Accounts
+    values(Computer) as Destinations
+    values(IpAddress) as SourceIPs
+    by WorkstationName
+A matching Event 4624 provides strong evidence of a successful Windows logon on the destination.
+Compare:
+	●	TargetUserName
+	●	TargetDomainName
+	●	Source IP
+	●	Destination hostname
+	●	Timestamp
+	●	TargetLogonId
+Do not assume Event 1149 and 4624 represent the same session without corroborating timestamp, account and source information.
+9. Hunt 7 – Identify privileged account activity
+Event ID 4672 – Special privileges assigned
+index=* EventCode=4672 earliest=-24h
+| table _time Computer SubjectUserName
+    SubjectDomainName SubjectLogonId PrivilegeList
+| sort 0 _time
+Query 7B – Correlate privileged logons with successful RDP
+index=* EventCode IN (4624,4672) earliest=-24h
+| eval Account=coalesce(TargetUserName,SubjectUserName)
+| eval Domain=coalesce(TargetDomainName,SubjectDomainName)
+| eval LogonID=coalesce(TargetLogonId,SubjectLogonId)
+| stats
+    values(EventCode) as Events
+    values(Account) as Accounts
+    values(Domain) as Domains
+    values(LogonType) as LogonTypes
+    values(IpAddress) as SourceIPs
+    values(PrivilegeList) as Privileges
+    by Computer LogonID
+| where mvfind(Events,"4624")>=0
+    AND mvfind(Events,"4672")>=0
+This is a same-host logon-ID correlation. It helps establish whether the successful logon received special privileges.
+Event 4672 does not automatically mean malicious activity. Legitimate administrative and system accounts can routinely receive special privileges.
+10. Hunt 8 – Investigate Kerberos authentication
+If the environment uses Active Directory and Kerberos, investigate Event ID 4769 on domain controllers.
+RDP commonly uses the TERMSRV service principal.
+Query 8A – Search for RDP-related service tickets
+index=* EventCode=4769 earliest=-24h
+| search ServiceName="*TERMSRV*"
+| table _time Computer
+    TargetUserName ServiceName
+    IpAddress TicketEncryptionType
+    Status FailureCode
+| sort 0 _time
+Query 8B – Search for the suspected service account
+index=* EventCode=4769 TargetUserName="svc_admin" earliest=-24h
+| table _time Computer
+    TargetUserName ServiceName
+    IpAddress TicketEncryptionType
+    Status FailureCode
+| sort 0 _time
+Investigate:
+	●	Was the service account requesting a ticket for the suspected jump box?
+	●	Did the ticket request originate from the expected source?
+	●	Was the target SPN consistent with the RDP destination?
+	●	Were there unusual ticket requests to multiple servers?
+Field names and service-name formatting vary between Windows event parsers. Inspect raw XML before assuming a field extraction is correct.
+11. Hunt 9 – Investigate activity after successful access
+Do not stop at successful authentication. Investigate what the account did after logging in.
+Event ID 4688 – Process creation
+index=* EventCode=4688 SubjectUserName="svc_admin" earliest=-24h
+| table _time Computer SubjectUserName
+    NewProcessName CreatorProcessName
+    ProcessId NewProcessId CommandLine
+| sort 0 _time
+Look for unusual execution:
+	●	powershell.exe
+	●	cmd.exe
+	●	wmic.exe
+	●	net.exe
+	●	net1.exe
+	●	psexec.exe
+	●	rundll32.exe
+	●	reg.exe
+	●	schtasks.exe
+	●	certutil.exe
+Event ID 4728 – Global security group membership
+index=* EventCode=4728 earliest=-24h
+| table _time Computer
+    SubjectUserName MemberName
+    MemberSid TargetUserName
+| sort 0 _time
+Event ID 4732 – Local security group membership
+index=* EventCode=4732 earliest=-24h
+| table _time Computer
+    SubjectUserName MemberName
+    MemberSid TargetUserName
+| sort 0 _time
+Event ID 7045 – New service installed
+index=* EventCode=7045 earliest=-24h
+| table _time Computer
+    ServiceName ImagePath
+    ServiceType StartType AccountName
+| sort 0 _time
+Investigate whether the account:
+	●	Executed administrative commands.
+	●	Created scheduled tasks.
+	●	Added users to privileged groups.
+	●	Installed new services.
+	●	Accessed other servers.
+	●	Executed PowerShell scripts.
+	●	Established additional remote sessions.
+12. Hunt 10 – Build the RDP timeline
+This search brings together multiple Windows event sources for the investigation window.
+index=* earliest=-24h
+(
+    EventCode=1024
+    OR EventCode=1029
+    OR EventCode=4648
+    OR EventCode=4688
+    OR EventCode=1149
+    OR EventCode=4624
+    OR EventCode=4672
+    OR EventCode=4769
+)
+| eval EventDescription=case(
+    EventCode=1024,"RDP destination attempt",
+    EventCode=1029,"RDP username hash",
+    EventCode=4648,"Explicit credentials",
+    EventCode=4688,"Process creation",
+    EventCode=1149,"RDP authentication",
+    EventCode=4624,"Successful logon",
+    EventCode=4672,"Special privileges",
+    EventCode=4769,"Kerberos service ticket",
+    true(),"Other"
+)
+| table _time Computer EventCode
+    EventDescription User SubjectUserName
+    TargetUserName TargetDomainName
+    ProcessName NewProcessName
+    IpAddress WorkstationName Message
+| sort 0 _time
+Use the known source host, suspected account and timestamp to narrow this search before running it across a large production index.
+13. Advanced correlation – Original user versus service account
+This is the central analytical question.
+Illustrative scenario:
+Original interactive user:
+DOMAIN\user01
+
+RDP credential account:
+DOMAIN\svc_admin
+
+Destination:
+JUMPBOX01
+Query – Combine explicit credential events and successful RDP logons
+index=* earliest=-24h
+(
+    EventCode=4648
+    OR EventCode=4624
+)
+| eval Account=TargetUserName
+| eval SourceIP=coalesce(IpAddress,Source_Network_Address)
+| eval Destination=if(EventCode=4648,TargetServerName,Computer)
+| eval InitiatingUser=SubjectUserName
+| eval EventType=case(
+    EventCode=4648,"Explicit credentials",
+    EventCode=4624 AND LogonType=10,"RDP successful logon",
+    true(),"Other logon"
+)
+| where EventType!="Other logon"
+| table _time Computer EventCode EventType
+    InitiatingUser Account TargetDomainName
+    Destination SourceIP TargetLogonId
+| sort 0 _time
+Analyst caution: Event 4648’s TargetServerName and Event 4624’s Computer are not interchangeable. The first describes the explicit-credential target recorded by that event; the second is the computer that recorded the successful logon. Treat them as separate evidence until correlated.
+14. Hunt for suspicious service-account usage
+A service account being used interactively through RDP may violate organisational policy.
+Query – Service account logon behaviour over seven days
+index=* EventCode=4624 TargetUserName="svc_admin" earliest=-7d
+| eval LogonCategory=case(
+    LogonType=2,"Interactive",
+    LogonType=3,"Network",
+    LogonType=4,"Batch",
+    LogonType=5,"Service",
+    LogonType=7,"Unlock",
+    LogonType=9,"NewCredentials",
+    LogonType=10,"RemoteInteractive",
+    LogonType=11,"CachedInteractive",
+    true(),"Other"
+)
+| stats count
+    earliest(_time) as FirstSeen
+    latest(_time) as LastSeen
+    values(LogonCategory) as LogonTypes
+    values(Computer) as Hosts
+    values(IpAddress) as SourceIPs
+    by TargetUserName TargetDomainName
+| convert ctime(FirstSeen) ctime(LastSeen)
+Investigate:
+	●	Is this account normally used interactively?
+	●	Does it usually authenticate from this workstation?
+	●	Has it accessed other jump boxes?
+	●	Is RDP usage authorised?
+	●	Is there a documented reason for the service account to be used?
+15. Evidence collection and limitations
+￼
+Evidence                            Confidence and limitation
+￼
+RDP Event 1024                      Strong evidence of destination attempted; not proof of successful access
+RDP Event 1029                      Username hash; candidate comparison only
+Event 4648                          Evidence of explicit credential usage when the correct fields are present
+Event 1149                          RDP authentication evidence; correlate with session logon
+Event 4624 Type 10                  Strong evidence of successful remote interactive logon
+Event 4672                          Privileged token assignment, not proof of malicious privilege use
+Registry MRU                        Historical destination evidence, not definitive timestamped connection proof
+EDR telemetry                       Additional process, identity and network context, depending on product and configuration
+Critical limitation: Windows logs do not guarantee preservation of the exact literal username typed into the credential dialog. The account successfully authenticated is usually recoverable from destination-side evidence. The exact text entered may require additional client-side telemetry.
+16. Final investigation decision matrix
+￼
+Finding                             Interpretation
+￼
+MSTSC launched, no destination      Incomplete evidence or telemetry event                               gap
+Event 1024, no destination logon    Attempted connection; success not established
+Event 1024 + 1149 + matching 4624   Strongly corroborated RDP session
+Event 4648 identifies alternate     Explicit credential usage supported account
+4624 Type 10 identifies service     Service account successfully logged account                             on remotely
+4672 follows matching logon         Special privileges assigned
+Unusual 4688 activity after logon   Further investigation required
+Service account accesses unexpected Potential lateral movement hosts
+17. Recommended final SOC finding
+Use this structure when writing the investigation report:
+Initial observation: A user initiated a Remote Desktop connection from the source workstation. Process telemetry identified explorer.exe, mstsc.exe and CredentialUIBroker.exe.
+Destination identification: RDP Client Operational Event 1024 was examined to establish the destination hostname or IP address.
+Credential validation: Event 4648, where available, was reviewed to identify the account whose explicit credentials were used. Event 1029 was examined for candidate username hash validation.
+Authentication validation: Destination-side Event 1149 and Security Event 4624 were correlated to establish the account and source associated with the RDP session.
+Post-authentication activity: Events 4672 and 4688, alongside relevant account and service creation events, were reviewed to identify privileged activity following the successful logon.
+Conclusion: State whether the evidence confirms the original user, destination host, authenticated account and successful RDP session. Explicitly identify missing telemetry and avoid claiming that the exact username typed was recovered unless the evidence supports that conclusion.
+18. Analyst checklist
+	￼	Identify source workstation.
+	￼	Establish original interactive user.
+	￼	Identify MSTSC process execution.
+	￼	Identify CredentialUIBroker execution.
+	￼	Recover destination using Event 1024.
+	￼	Retrieve Event 1029 username hash.
+	￼	Check Event 4648 for explicit credentials.
+	￼	Validate suspected service account.
+	￼	Check destination Event 1149.
+	￼	Confirm Event 4624 Logon Type 10.
+	￼	Correlate source IP and destination hostname.
+	￼	Check Event 4672.
+	￼	Investigate post-login processes.
+	￼	Review other systems accessed by the account.
+	￼	Document evidence gaps and final assessment.
+19. Recommended hunt priority
+Start with these three searches:
+	1.	Event 1024: Find the hostname entered.
+	2.	Event 4648: Identify explicit credential usage, if captured.
+	3.	Event 4624 Type 10: Validate the successful account and source.
+These provide the foundation for the investigation.
+20. Technical references
+	●	Microsoft Learn – Audit Logon
+	●	Microsoft Learn – Audit Logoff
+	●	Microsoft Learn – Audit Process Creation
+	●	Microsoft Learn – Windows Security Auditing
+	●	MITRE ATT&CK – T1021.001 Remote Desktop Protocol
+	●	MITRE ATT&CK – T1078 Valid Accounts
